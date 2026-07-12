@@ -2,11 +2,6 @@
 
 ## 1. Coordination service options, and the trade-offs of each
 
-The assignment says "you can assume something Redis-like, or etcd/
-ZooKeeper-like; your choice, state your assumption." Four concrete
-options were actually on the table. Three are rejected below, with
-reasons and trade-offs, not just named and dismissed; the fourth is what
-this repo implements as the primary path.
 
 ### Option 1 — Single-instance Redis
 
