@@ -1,199 +1,297 @@
 # The Coordinator — Design Note
 
-## Assumption: what "the coordination service" is
+## Assumption: the coordination service
 
-I assumed a **single, non-clustered Redis instance**, reached over a normal
-client connection (`JedisRedisClient`, using Jedis). Not Redis Cluster, not a
-multi-instance Redlock deployment, not etcd/ZooKeeper.
+Two coordination services are actually implemented, not just discussed:
+a single, non-clustered Redis instance (`RedisLock`, via Jedis), and a
+ZooKeeper ensemble (`ZooKeeperLock`, via the raw ZooKeeper client). Each
+gets its own concurrency harness (`Simulate`, `ZkSimulate`). This wasn't
+necessary to satisfy the assignment — either backend alone would have —
+but the two make structurally different trade-offs, and demonstrating
+both, honestly, says more about the judgment call than picking one and
+asserting the other would also work. See "Redis vs ZooKeeper" below.
 
-I picked this because it's the simplest thing that could plausibly match the
-inherited note's "we've been running this for months and it's basically
-fine" — and because the exercise is explicit that it wants reasoning about
-what a TTL lock does and doesn't give you, not a consensus system ("we're
-not asking you to reimplement Raft"). A single Redis instance is also,
-necessarily, a single point of failure. I'm naming that trade-off here
-rather than hiding it; it comes back under "production" below.
+Redis is assumed single-instance: not Redis Cluster, not a multi-instance
+Redlock deployment. That's a real limitation (a SPOF), named here and
+revisited below, not hidden. ZooKeeper is assumed to run as a proper
+odd-sized ensemble (3 or 5 nodes); the `docker-compose.yml` here runs a
+single node for local development convenience only, which throws away
+ZooKeeper's actual fault-tolerance advantage — see "what's cut."
 
-The lock/coordination component (`RedisLock`) is written against a small
-`RedisCoordinationClient` interface, not directly against Jedis, with two
-implementations: `JedisRedisClient` (real Redis — the intended coordination
-service) and `InMemoryRedisClient` (the in-memory stand-in the assignment
-explicitly allows, used to run the test harness with zero external
-infrastructure). Both implement the same four primitives: conditional-set-
-with-expiry, conditional-delete, conditional-extend, and an atomic counter.
-That list is deliberately short — it's exactly what the guarantee below
-depends on, and it's the same four primitives you'd need to reproduce on
-etcd or ZooKeeper if you swapped the backend later.
+Both locks are written against small, backend-appropriate contracts
+rather than against a single interface that pretends the two are
+interchangeable underneath: `RedisLock` against `RedisCoordinationClient`
+(four TTL-key primitives — conditional-set-with-expiry, conditional-
+delete, conditional-extend, atomic increment); `ZooKeeperLock` directly
+against the ZooKeeper client, because its primitive (sequential ephemeral
+znode + watch) isn't TTL-key-shaped and forcing it through the Redis
+interface would hide the differences that matter. What they *do* share is
+a thin `EntityLockManager` / `AcquiredEntityLock` contract — acquire,
+release, fencing token, best-effort extend — which is exactly the level
+at which the two backends can be honestly interchangeable: `JobRunner`
+and both harnesses are written once against that contract.
 
 ## The guarantee
 
-Precisely: **for a given entity key, the protected resource never applies a
-write whose fencing token is not strictly greater than every fencing token
-it has already accepted for that entity.**
+Precisely: **for a given entity key, the protected resource never applies
+a write whose fencing token is not strictly greater than every token it
+has already accepted for that entity.**
 
-That is *not* the same statement as "at most one worker executes the
-critical section at a time," and the difference is the entire point of this
-exercise. The lock alone can promise the weaker thing — that at most one
-worker *holds the lock key* at any Redis-observed instant, via `SET NX PX`
-to acquire and a Lua-scripted compare-and-delete to release (so a worker
-can never release a lock it no longer owns, the classic bug in a naive
-"just `DEL` on release" implementation). But lock possession is not
-mutual exclusion over the critical section, because a worker can be
-descheduled — GC pause, blocked syscall, CPU steal — for an unbounded,
-*unknowable* amount of time while it still believes it holds the lock.
+That is *not* "at most one worker executes the critical section at a
+time" — the difference is the point of this exercise, on either backend.
+Redis's lock alone only promises that at most one worker holds the lock
+key at a given Redis-observed instant (`SET NX PX` to acquire, a
+Lua-scripted compare-and-delete to release). ZooKeeper's lock alone only
+promises that at most one worker holds the lowest-sequence ephemeral
+znode at a given instant. In both cases, a worker can be descheduled —
+GC pause, blocked syscall, CPU steal — for an unbounded, *unknowable*
+amount of time while it still believes it holds the lock. Lock possession
+is never mutual exclusion over the critical section; it's a claim about
+the lock's own state, which the worker cannot reliably observe once it's
+been paused.
 
-So the guarantee I can actually stand behind lives one layer up, at the
-resource, via the fencing token: a counter (`INCR`) that is separate from
-the lock key, has no TTL of its own, and only ever increases for a given
-entity, regardless of how many times the lock on that entity has been
-acquired, expired, or stolen. `ProtectedResource.write()` rejects anything
-that isn't strictly greater than the last accepted token. This holds
-independent of lock correctness, clock behavior, network delay, or worker
-stalls, **given two assumptions**:
+The guarantee actually lives one layer up, at the resource, via the
+fencing token — a value that only ever increases for a given entity,
+regardless of how many times the lock has been acquired, expired, or
+stolen. `ProtectedResource.write()` rejects anything not strictly greater
+than the last accepted token. This holds independent of clock behavior,
+network delay, or worker stalls, **given two assumptions**:
 
-1. **Redis's fencing counter is available and not silently rolled back.**
-   If Redis fails over to a replica that hasn't yet seen the latest `INCR`,
-   the new primary can hand out a token that's *lower* than one already
-   used, and the whole mechanism is defeated without anyone knowing. A
+1. **The fencing token source is available and never silently rolls
+   back.** For Redis: if it fails over to a replica that hasn't yet seen
+   the latest `INCR`, the new primary can hand out a token lower than one
+   already used, defeating the mechanism without anyone knowing — a
    single non-clustered instance sidesteps this by having no failover to
-   roll back to — at the cost of being a SPOF (see "production").
+   roll back to, at the cost of being a SPOF. For ZooKeeper: the sequence
+   number is assigned as part of the replicated log (Zab), so it survives
+   leader failover as long as a quorum of the ensemble is intact — this
+   assumption is *structurally* satisfied rather than sidestepped, which
+   is the main correctness argument for ZooKeeper over single-instance
+   Redis (see below).
 2. **The fencing token is the sole authority for whether a write is
-   allowed to land.** This has to hold for every side effect the worker
-   triggers, not just the call into `ProtectedResource`. See the next
-   section — this is exactly where it breaks.
+   allowed to land** — for every side effect the worker triggers, not
+   just the call into `ProtectedResource`. This holds identically on
+   either backend, and is exactly where it breaks; see next section.
 
 ## The failure you can't prevent at the lock
 
-Worst case, concretely: Worker A acquires the lock and fencing token 41,
-then stalls past its TTL doing "the work" — say, calling an external
-payment gateway partway through the critical section. The lock expires.
-Worker B acquires the lock, gets token 42, does its work, writes to the
-resource with token 42, releases. Worker A now wakes up with **no
-awareness that time passed** (per the prompt's own framing) and finishes
-what it was doing — including any external call that had *already been
-sent* before it woke up. It then tries to write to `ProtectedResource`
-with token 41. The resource correctly rejects it: `41 <= 42`.
+Worker A acquires the lock and fencing token 41, then stalls past its
+lock's liveness window mid-critical-section — say, after it has already
+sent a request to an external payment gateway. The lock is reclaimed
+(TTL expiry on Redis; session expiry on ZooKeeper). Worker B acquires it,
+gets token 42, does its work, writes with 42, releases. Worker A wakes up
+with no awareness that time passed and tries to write with 41. The
+resource correctly rejects it: `41 ≤ 42`. The ledger stays consistent —
+on either backend, by the same mechanism.
 
-So the ledger write is safe. But Worker A may have already caused an
-external side effect — the payment gateway call — that already fired and
-cannot be un-sent through this mechanism. **That's the failure this design
-cannot prevent at the lock: a non-idempotent side effect triggered by a
-worker who has since been fenced out.** It isn't caught by
-`ProtectedResource` at all, because `ProtectedResource` only sees the
-*write attempt*, not whatever the worker did on the way there. It's caught
-only if:
-
-- the downstream system is itself idempotent, or
-- the fencing token (or some other proof-of-freshness) is threaded through
-  to that downstream call as an idempotency key, so the *external* system
-  does the rejecting instead of ours.
-
-If neither is true, there's no way to prevent this at the lock layer — this
-is exactly the "double charge" scenario named in the prompt, and the real
-fix is not a better lock, it's pushing the fencing token as far downstream
-as the money actually moves. Absent that, the only backstop is
-reconciliation: an audit process comparing the external system's log
-against `ProtectedResource`'s rejected-write log (which this repo keeps,
-for exactly this reason) to catch what the lock couldn't.
-
-Also worth naming directly: this design doesn't defend against Redis
-itself losing the fencing counter's value across an ungraceful failover
-(see assumption 1 above). I'm not solving that here — I'm scoping it out by
-assuming a single instance, and flagging it as the first thing that needs
-addressing before this goes anywhere near multi-node Redis.
+But Worker A may already have caused an external side effect — the
+payment gateway call — that had already fired and cannot be un-sent
+through this mechanism. **That's the failure this design cannot prevent
+at the lock: a non-idempotent side effect triggered by a worker who has
+since been fenced out.** `ProtectedResource` only ever sees the write
+attempt, not whatever the worker did on the way there. It's caught only
+if the downstream system is itself idempotent, or if the fencing token is
+threaded through to that call as an idempotency key, so the *external*
+system does the rejecting instead of ours. Absent either, the only
+backstop is reconciliation: an audit process comparing the external
+system's log against `ProtectedResource`'s rejected-write log (kept for
+exactly this reason) to catch what the lock couldn't. This is entirely
+backend-independent — swapping Redis for ZooKeeper does not touch this
+gap at all, which is itself worth naming: better coordination primitives
+do not make non-idempotent downstream calls safe.
 
 ## The TTL decision
 
-Both extremes are real and neither is free:
+Both extremes are real and neither is free. **Too short:** a legitimate
+long-running job loses its lock mid-flight; a second worker starts on the
+same entity believing it has exclusivity; wasted work, and possibly a
+non-idempotent side effect that already fired. **Too long:** a worker
+that's actually dead holds the entity hostage for the full TTL/session
+window before anyone else can make progress — an availability cost, not
+a correctness one, but real.
 
-- **Too short:** a legitimate long-running job gets its lock stolen
-  mid-flight. Another worker sees the entity "available," starts working
-  on it, and now two workers believe — at the lock layer — that they have
-  exclusive access simultaneously. The fencing token still protects the
-  resource, but you've paid for wasted work and, per the section above,
-  possibly a non-idempotent side effect that already fired.
-- **Too long:** a worker that's actually dead (not paused, gone) holds the
-  entity hostage for the full TTL before anyone else can make progress.
-  This is an availability cost, not a correctness one — but it's still
-  real, and it scales badly if "the entity" is something customers are
-  waiting on.
+**On the Redis path**, the fix is to decouple "how long can a legitimate
+job run" from "how fast do I detect a dead worker" by making the lock
+renewable (`AcquiredLock.extend()` exists for this) and heartbeating
+while actively making progress: TTL only needs to cover one heartbeat
+interval, not the longest possible job. The catch, stated directly:
+heartbeating helps with legitimate long jobs but does nothing for "worker
+stalled and doesn't know it," because a stalled worker can't heartbeat
+either — that's exactly why fencing at the resource remains the real
+backstop regardless. **What's actually wired up:** the Redis harness uses
+a fixed TTL and `JobRunner` never calls `extend()` — the wiring exists on
+`AcquiredLock` but isn't plugged into the worker loop. A stated,
+deliberate cut for time (see "what's cut").
 
-There is no single TTL value that avoids both, because "how long can a
-legitimate job run" and "how fast do I want to detect a dead worker" are
-in direct, structural tension. Concretely, what I'd do:
+**On the ZooKeeper path, this tension is partially defused rather than
+solved.** Liveness is a session property, heartbeated automatically by
+the client library on its own thread — a worker that's merely slow
+(blocked on I/O, doing CPU work) does not lose its lock, with no
+`extend()` call anywhere, because the heartbeat isn't coupled to the
+job's own execution. This was verified directly (see "Verification"): a
+worker that sleeps 4 seconds with zero manual renewal still commits under
+ZooKeeper, where the equivalent shape of stall under the *un-heartbeated*
+Redis harness here would have lost the lock. That closes the "I forgot to
+wire up heartbeating" failure mode by construction — but it does not
+touch the fundamental tension. A true GC-stop-the-world pause freezes the
+heartbeat thread too, so a genuinely stalled worker still loses its
+session, same as Redis losing a TTL race. And ZooKeeper adds a *new*
+version of the "too short" problem that Redis doesn't have: session
+timeout is negotiated against ensemble-configured bounds (commonly a
+handful of seconds, driven by `tickTime`), so you generally cannot push
+it into the low-hundreds-of-milliseconds range this Redis harness uses.
+If sub-second dead-worker detection is a hard requirement, ZooKeeper's
+session model is a worse fit than a well-tuned Redis TTL, despite being
+better on the failover-safety axis. "It depends" — specifically, on
+whether the workload's minimum acceptable dead-worker-detection latency
+is above or below a few seconds.
 
-**Decouple the two questions** by making the lock renewable rather than
-fixed-TTL-for-the-whole-job (`AcquiredLock.extend()` / `compareAndExpire`
-exist in this repo for exactly this). Set the TTL to something short
-relative to *normal* job latency — a small multiple of p99 for the typical
-case, plus scheduler/network jitter headroom — not to the outlier long
-jobs. Have the worker heartbeat/extend the lock periodically while it's
-actively making progress. This turns "TTL must cover the longest possible
-job" into "TTL must cover one heartbeat interval," which is a much smaller
-and more defensible number, and it means a worker that's *actually*
-stalled — not heartbeating — still gets reaped promptly, which one large
-fixed TTL can never give you.
+## Redis vs ZooKeeper
 
-The catch, and I want to be explicit about it rather than wave past it:
-heartbeating helps with legitimate long jobs, but it does **nothing** for
-the "worker stalled and doesn't know it" case, because a stalled worker
-also can't send a heartbeat. That's exactly why this doesn't remove the
-need for fencing at the resource — heartbeating narrows the TTL question,
-it doesn't answer the mutual-exclusion question. I never treat "the lock
-hasn't expired yet" as proof of exclusivity; I treat lock expiry as "assume
-someone else may now also believe they own this," always.
+The two are not interchangeable "pick either" options; they trade
+specific, nameable things against each other:
 
-**What this repo actually does:** the harness uses a fixed TTL (a few
-hundred ms, for demo speed) and `JobRunner` does not call `extend()` — the
-heartbeat wiring exists on `AcquiredLock` but isn't plugged into the worker
-loop. That's a stated, deliberate cut for time; see below.
+- **Fault tolerance.** Single Redis is a SPOF by this design's own
+  assumption. ZooKeeper's ensemble tolerates a minority of node failures
+  via quorum consensus (Zab) — but that's only realized if you actually
+  run an odd-sized multi-node ensemble; the single-node ZooKeeper in this
+  repo's `docker-compose.yml` is a convenience, not a demonstration of
+  this property (see "what's cut").
+- **Fencing-token durability across failover.** This is the sharpest
+  correctness distinction. Redis's `INCR` counter can go backwards if a
+  stale replica is promoted after an ungraceful failover — the open risk
+  named in "the guarantee," assumption 1, and never actually closed by
+  this design on the Redis side. ZooKeeper's sequence number is part of
+  the replicated log itself; it cannot be handed out lower than a
+  previously-issued value as long as a quorum remains intact. If "the
+  fencing token must never roll back" is a hard requirement, ZooKeeper
+  structurally satisfies it and single-instance Redis structurally does
+  not.
+- **Liveness mechanism.** Redis TTL requires an app-level heartbeat that
+  someone has to remember to wire up correctly (this repo didn't).
+  ZooKeeper session heartbeating is automatic, library-managed, and
+  decoupled from the job's own thread — fewer ways for an engineer to get
+  this wrong, at the cost of losing fine control over exactly when a
+  lock's liveness check happens.
+- **Minimum reclaim latency.** Redis TTL can be tuned arbitrarily low
+  (this harness uses 300ms) at the cost of clock-skew/jitter risk.
+  ZooKeeper session timeout has a practical floor set by the ensemble's
+  `tickTime` (commonly a few seconds) — you cannot generally get
+  sub-second dead-worker detection out of it.
+- **Acquisition mechanism.** Redis here polls (`SET NX`, retried every
+  20ms) — a named, deliberate simplification, not a strength. ZooKeeper's
+  watch-on-predecessor is push-based by construction: no polling loop, no
+  herd effect (only the immediate predecessor is watched, not the holder
+  or the full queue).
+- **Fencing-token width.** Redis's `INCR` counter is 64-bit and will not
+  realistically wrap. ZooKeeper's per-parent sequence number is 32-bit;
+  a single entity key that's locked roughly 2^31 times over its lifetime
+  would wrap. Unlikely to matter for most workloads, but it's a real,
+  nameable limitation the Redis path doesn't share, and "the guarantee"
+  should be precise about it rather than silent.
+- **Write latency and throughput.** Every ZooKeeper znode create/delete
+  is a Zab consensus round requiring a majority ack across the ensemble —
+  strictly higher latency than one round-trip to a single Redis instance.
+  Under high lock churn, Redis will out-throughput ZooKeeper on the lock
+  operations themselves; you're paying that latency for the durability
+  guarantee above.
+- **Client complexity and operational maturity.** Jedis is a thin,
+  hard-to-misuse client; there's nothing to run besides Redis itself.
+  Raw ZooKeeper client usage is a known footgun — watch semantics,
+  `SyncConnected` vs `Expired` vs `Disconnected` session states, and
+  reconnection edge cases are exactly what Curator's `InterProcessMutex`
+  exists to handle correctly. `ZooKeeperLock` here hand-rolls the
+  standard recipe instead of depending on Curator, specifically to keep
+  the algorithm visible for review (this exercise is about reasoning
+  about the primitive, not about picking a library) — but that is a real
+  production trade-off, not a free simplification; see "what's cut."
+- **What it's actually for.** ZooKeeper (like etcd) is a
+  coordination/metadata service with correctness as its design center —
+  the more "proper" tool for exactly the problem in this exercise, and
+  the direction the original design note (Redis-only) pointed to as the
+  fix for its own SPOF risk. Redis is an operationally simpler,
+  frequently-already-present store being *reused* for coordination —
+  faster and cheaper to run, but borrowing a correctness property
+  (a linearizable counter) from a system not built to guarantee it.
+
+**If I had to pick one for this specific problem** (a billing
+ledger / document store / inventory record, where a rolled-back fencing
+token means a silent double charge): ZooKeeper, specifically because of
+the failover-durability point above — that's the one gap the Redis
+design never closes without adding a second coordination system anyway
+(the original design note's own "production" list said as much: "move
+the fencing counter to etcd or ZooKeeper"). This repo builds it, rather
+than continuing to just recommend it.
 
 ## What I'd do with more time / in production
 
-- **Wire heartbeating into the worker loop.** `extend()` exists but nothing
-  calls it yet — this is the highest-value thing left undone.
-- **Propagate the fencing token downstream** as an idempotency key to any
-  external call a worker makes mid-critical-section, so "the failure you
-  can't prevent at the lock" has an actual backstop instead of just being
-  named in a doc.
-- **Remove Redis as a silent SPOF** without breaking the fencing guarantee:
-  either accept the availability hit and require `WAIT`/AOF-fsync
-  acknowledgment before trusting an `INCR`, or move the fencing counter
-  specifically to something with a real linearizable log — I'd lean
-  etcd or ZooKeeper for the counter (ZK's sequential ephemeral znodes give
-  you a fencing token natively), and keep something Redis-shaped, or
-  nothing, for the advisory lock itself. The counter is the piece
-  correctness actually rests on; the lock is just a scheduling hint.
-- **Add reconciliation.** `ProtectedResource.rejected()` exists so an audit
-  job can look for evidence that a rejected writer's side effects still
-  landed somewhere else, and alert or compensate.
-- **Replace polling `acquire()`** with Redis keyspace notifications or a
-  proper wait list — under real contention, N workers all polling every
-  20ms is wasted CPU and network for no benefit.
-- **Test against real faults, not `Thread.sleep()`.** The stalled-worker
-  scenario in `Simulate` fakes a GC pause with a sleep; a more honest test
-  suite would use `kill -STOP`/`-CONT` on a real worker process, and
-  something like Toxiproxy to inject actual network delay/partition
-  between a worker and Redis/the resource, rather than simulating both in
-  one process.
+- **Run ZooKeeper as a real multi-node ensemble** (3 or 5 nodes) and
+  actually test the failover-durability claim above by killing a
+  minority of nodes mid-run and confirming fencing tokens still never go
+  backwards. The single-node `docker-compose.yml` here proves the
+  algorithm, not the fault-tolerance property that's the whole reason to
+  prefer ZooKeeper.
+- **Switch to Curator's `InterProcessMutex`** (or at least its recipes)
+  for production ZooKeeper usage instead of the hand-rolled
+  `ZooKeeperLock` here, specifically for its handling of session
+  reconnection edge cases (a `Disconnected` event is not the same as
+  `Expired`, and a naive watcher can double-fire or miss events across a
+  reconnect) that this simplified version does not handle.
+- **Wire heartbeating into the Redis worker loop.** `extend()` exists but
+  nothing calls it yet on that path — still the highest-value gap if
+  Redis remains in use for latency-sensitive, short-TTL entities.
+- **Propagate the fencing token downstream** as an idempotency key on any
+  external call a worker makes mid-critical-section, on either backend —
+  "the failure you can't prevent at the lock" has no backstop today
+  beyond being named in this doc.
+- **Add reconciliation.** `ProtectedResource.rejected()` exists so an
+  audit job can look for evidence that a rejected writer's side effects
+  landed somewhere else anyway, and alert or compensate.
+- **Test against real faults, not `Thread.sleep()`/force-closed
+  sessions.** Both stalled-worker scenarios fake their failure with
+  application-level timing tricks; a more honest suite would use
+  `kill -STOP`/`-CONT` on a real worker process and something like
+  Toxiproxy for actual network delay/partition between a worker and its
+  coordination backend, rather than simulating the failure in the same
+  process that's supposed to be failing.
 - **Run workers as separate processes,** not threads sharing one JVM
-  object as "the resource." The current harness proves the ordering logic
-  is correct, but it doesn't exercise real network reordering between a
-  worker and a remote resource — everything here is in-process for
-  speed and simplicity.
+  object as "the resource," on either harness — proves the ordering
+  logic but not real network reordering or a real crashed process (as
+  opposed to a `.close()` call) losing a ZooKeeper session.
 
-## One more thing worth naming: how this was actually built and checked
+## Verification
 
-The environment I built this in had **no outbound network access at all**
-(Maven Central, PyPI, npm, and github.com were all blocked at the proxy
-level) and **no JDK compiler** — only a JRE. That's why the design leans on
-a narrow `RedisCoordinationClient` interface with an in-memory
-implementation: it let me actually exercise the algorithm's logic somehow,
-even though in the end I couldn't compile *any* of it myself in that
-environment (no `javac`). I want to be direct about that rather than imply
-a level of verification that didn't happen: this code has been carefully
-hand-reviewed against the Jedis and JUnit APIs from memory, but the `mvn
-test` / `javac` path has not actually been executed by me. Please run it
-before treating this as done — see README for exact commands. If I'd had
-a working toolchain, closing that gap would have been the first thing I
-did, ahead of everything in the list above.
+Neither the original Redis code (`RedisLock`, `ProtectedResource`,
+`JobRunner`, `InMemoryRedisClient`, `JedisRedisClient`) nor the newer
+ZooKeeper code (`ZooKeeperLock`, `AcquiredZkLock`) has been compiled or
+run directly in the environments this was built in — no JDK compiler was
+available for the first, and no route to Maven Central to fetch the
+ZooKeeper client jar was available for the second, on top of still having
+no `javac`. Both have been reviewed line by line against their respective
+client APIs (Jedis 5.x, ZooKeeper 3.9.x) from documentation and memory.
+
+Beyond review, each locking algorithm was independently ported to Python
+and actually executed, using the same fencing-check logic and the same
+class of scenarios as the Java harnesses:
+
+- `verify/verify_fencing.py` (Redis/TTL model): baseline, high
+  contention, and a stalled-worker case where a worker's token is
+  rejected after another worker takes over past the TTL. **20/20 runs
+  passed**, including 10 runs of the stalled-worker case, each producing
+  exactly one commit and one rejection with the expected tokens.
+- `verify/verify_zk_fencing.py` (ZooKeeper/session model): baseline, high
+  contention, a "slow but alive" worker that keeps its lock through a
+  multi-second sleep with zero heartbeat calls, and a "session expired"
+  case where a worker's session is force-expired mid-job and a queued
+  second worker takes over via a watch. **30/30 runs passed**, including
+  10 runs of the session-expiry case, each producing exactly one commit
+  and one rejection with the expected sequence-number tokens.
+
+That's real evidence both algorithms behave as claimed; it is not a
+substitute for `mvn test` and running both harnesses against live
+backends. Please do that before treating either path as final —
+`JedisRedisClient` and `ZooKeeperLock` are the two classes whose
+wire-level behavior against a live server hasn't been independently
+exercised here, and the ZooKeeper session-timeout floor described above
+in particular should be confirmed against whatever ensemble config is
+actually used, not assumed from documentation.
