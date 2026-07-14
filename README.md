@@ -1,10 +1,18 @@
 # The Coordinator
 
-A distributed lock with fencing tokens and a protected resource that
-enforces them. **Start with [DESIGN.md](DESIGN.md)** — that's where four
-candidate coordination services (single-instance Redis, Redis
-Cluster/Sentinel, Redlock, and ZooKeeper) are weighed against each other
-and ZooKeeper is chosen.
+A distributed lock with fencing tokens, and a protected resource that
+actually enforces them — built for a worker fleet where two workers
+touching the same entity at once (an account, a document, an inventory
+record) means real corruption: double charges, lost writes, duplicated
+shipments.
+
+- **[DESIGN.md](DESIGN.md)** — why ZooKeeper, not Redis: four candidate
+  coordination services weighed against explicit requirements, the
+  precise guarantee this design makes, the failure it can't prevent, and
+  the timeout trade-off.
+- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** — a tour of the code
+  itself: what each package does, how one request flows end to end, and
+  where in the code each claim in DESIGN.md is actually made true.
 
 ## The short version
 
@@ -56,7 +64,8 @@ src/test/java/...  JUnit 5 suite covering ProtectedResource's fencing
 verify/          Reference Python port of the locking algorithm, used to
                  pressure-test the fencing logic independently of the
                  Java implementation
-DESIGN.md        The design note
+DESIGN.md          The design note -- why ZooKeeper, the guarantee, the limits
+IMPLEMENTATION.md  A tour of the code itself
 docker-compose.yml  Local ZooKeeper ensemble for the real-backend paths
 ```
 

@@ -1,5 +1,20 @@
 # The Coordinator — Design Note
 
+A worker fleet processes jobs from a shared queue; some jobs touch a
+shared external resource (a billing ledger, a document store, an
+inventory record) where two workers acting on the same entity at the
+same time causes real, visible corruption — double charges, lost
+writes, duplicated shipments. This note covers the coordination
+component that prevents that, the reasoning behind the specific
+approach chosen, and where its guarantee actually stops.
+
+**Assumption stated up front:** the coordination service itself isn't
+fixed by the problem — the fleet could plausibly run against something
+Redis-like or something etcd/ZooKeeper-like. Section 4 treats that
+choice as the central design decision rather than a given, evaluates
+four concrete options against the requirements below, and picks one.
+Everything after section 6 describes the chosen option specifically.
+
 ## 1. Functional requirements
 
 - A worker must be able to acquire exclusive coordination rights ("the
@@ -389,9 +404,11 @@ conditions:
 1. The fencing token source never rolls back. For ZooKeeper this is
    structural: the sequence number is part of the replicated log itself
    and can't be reissued lower as long as a quorum of the ensemble
-   survives (section 4.4). The single-instance Redis path kept in this
-   codebase does not have this property, and shouldn't be trusted for
-   this guarantee if it's ever wired up for something real.
+   survives (section 4.4). A single-instance Redis counter does not have
+   this property -- an `INCR` on a promoted replica can hand out a value
+   already issued before the crash -- which is precisely why that option
+   was rejected in section 4 rather than carried into the
+   implementation.
 2. The fencing token is the sole authority for whether a write is
    allowed to land, for every side effect the worker triggers, not just
    the call into `ProtectedResource`. This holds regardless of backend,
