@@ -11,9 +11,9 @@
 
   <name>The Coordinator</name>
   <description>
-    Redis-backed distributed lock with fencing tokens, plus a protected
-    resource that enforces them and a concurrency simulation harness.
-    See DESIGN.md.
+    ZooKeeper-backed distributed lock with fencing tokens, plus a
+    protected resource that enforces them, a concurrency simulation
+    harness, and a small Spring Boot HTTP wrapper. See DESIGN.md.
   </description>
 
   <properties>
@@ -21,17 +21,55 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <junit.version>5.10.2</junit.version>
     <!-- If dependency resolution fails because this exact patch version
-         has been superseded, bump this to whatever the latest 5.x/4.x
-         Jedis release is -- nothing in this project depends on a
-         specific patch version. -->
-    <jedis.version>5.1.0</jedis.version>
+         has been superseded, bump this to whatever the latest 3.9.x
+         ZooKeeper release is -- nothing in this project depends on a
+         specific patch version. The ZooKeeper client pulls in its own
+         Netty/logging transitive dependencies; if those collide with
+         something else on the classpath, the shade plugin's relocation
+         features are the usual fix -- not attempted here since this
+         project has no other Netty user to collide with. -->
+    <zookeeper.version>3.9.2</zookeeper.version>
+    <!-- Spring Boot 2.7.x, not 3.x: Spring Boot 3 requires Java 17+,
+         and this project targets Java 11 so the CLI/ZooKeeper code
+         doesn't need a JDK bump just to add a Spring wrapper. -->
+    <spring-boot.version>2.7.18</spring-boot.version>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
-      <groupId>redis.clients</groupId>
-      <artifactId>jedis</artifactId>
-      <version>${jedis.version}</version>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.zookeeper</groupId>
+      <artifactId>zookeeper</artifactId>
+      <version>${zookeeper.version}</version>
+      <!-- Excludes ZooKeeper's bundled logging backend, which otherwise
+           tends to fight with whatever SLF4J binding ends up on the
+           classpath in a shaded jar. Nothing in this project logs
+           through it directly. -->
+      <exclusions>
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
+          <artifactId>logback-classic</artifactId>
+        </exclusion>
+        <exclusion>
+          <groupId>ch.qos.logback</groupId>
+          <artifactId>logback-core</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -55,9 +93,9 @@
         <version>3.2.5</version>
       </plugin>
       <plugin>
-        <!-- Produces target/the-coordinator.jar with dependencies bundled
-             and Simulate as the entry point, so `java -jar` works
-             directly. -->
+        <!-- Produces target/the-coordinator.jar with dependencies
+             bundled and ZkSimulate as the entry point, so `java -jar`
+             works directly against a reachable ZooKeeper ensemble. -->
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
         <version>3.5.2</version>
@@ -70,12 +108,25 @@
             <configuration>
               <transformers>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <mainClass>com.coordinator.sim.Simulate</mainClass>
+                  <mainClass>com.coordinator.sim.ZkSimulate</mainClass>
                 </transformer>
               </transformers>
             </configuration>
           </execution>
         </executions>
+      </plugin>
+      <plugin>
+        <!-- Deliberately NOT bound to the package phase: this project
+             already has maven-shade-plugin producing
+             target/the-coordinator.jar for the CLI harnesses in that
+             phase, and running both fat-jar plugins on the same
+             artifact in the same phase is a good way to get a broken
+             jar. Use `mvn spring-boot:run` for the web service during
+             development; add an execution here bound to a separate
+             classifier if a standalone Spring Boot fat jar is ever
+             needed for deployment. -->
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
       </plugin>
     </plugins>
   </build>

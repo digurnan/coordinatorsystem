@@ -1,0 +1,13 @@
+# Start the ensemble with: docker-compose up -d zookeeper
+
+server:
+  port: 8080
+
+coordinator:
+  zookeeper:
+    connect-string: localhost:2181
+    # Server-side minSessionTimeout/maxSessionTimeout bound what this
+    # value is actually negotiated down (or up) to -- see DESIGN.md,
+    # "timeout and liveness strategy," for why this can't be pushed into
+    # the low-hundreds-of-milliseconds range a TTL-based lock could.
+    session-timeout-millis: 6000

@@ -1,6 +1,16 @@
 services:
-  redis:
-    image: redis:7-alpine
+  zookeeper:
+    image: zookeeper:3.9
     ports:
-      - "6379:6379"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+      - "2181:2181"
+    environment:
+      # Exposes srvr/ruok/conf so you can sanity-check the ensemble with
+      # `echo ruok | nc localhost 2181` while debugging ZkSimulate.
+      ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok,conf,isro
+      # Default tickTime (ms); minSessionTimeout/maxSessionTimeout are
+      # 2x/20x this unless overridden. ZooKeeperLock requests a 6000ms
+      # session timeout, comfortably inside that default range -- see
+      # DESIGN.md, "timeout and liveness strategy," for why you can't
+      # push this anywhere near a TTL-based lock's low-hundreds-of-ms
+      # range.
+      ZOO_TICK_TIME: "2000"
