@@ -2,73 +2,73 @@
 
 ## 1. Functional requirements
 
-- **FR1.** A worker must be able to acquire exclusive coordination
+- A worker must be able to acquire exclusive coordination
   rights ("the lock") on a specific entity key before it touches the
   protected resource for that entity.
-- **FR2.** A worker must be able to release the lock once it's done.
-- **FR3.** If a worker dies or stalls without releasing, the lock must
+- A worker must be able to release the lock once it's done.
+- If a worker dies or stalls without releasing, the lock must
   become available to other workers automatically — no permanent
   deadlock, ever, regardless of how the worker failed.
-- **FR4.** Every successful acquisition produces a **fencing token**:
+- Every successful acquisition produces a fencing token:
   a value that is unique and strictly increasing per entity key, usable
   by the protected resource to detect and reject stale writes.
-- **FR5.** The protected resource must reject any write whose fencing
+- The protected resource must reject any write whose fencing
   token is not strictly greater than the last token it accepted for that
   entity — regardless of what the writer believes about its own lock
   status.
-- **FR6.** Locking is per-entity: contention on one entity key must not
+- Locking is per-entity: contention on one entity key must not
   block workers operating on a different, unrelated entity key.
-- **FR7.** Many workers may contend for the same entity concurrently;
+- Many workers may contend for the same entity concurrently;
   exactly one makes progress at a time, and losers either wait or are
   correctly rejected — never silently ignored.
-- **FR8.** Rejected writes must be observable (an audit trail), so a
+- Rejected writes must be observable (an audit trail), so a
   reconciliation process can detect whether a fenced-out worker's side
   effects landed somewhere else anyway.
-- **FR9.** A worker performing a long-running job must be able to renew
+- A worker performing a long-running job must be able to renew
   its claim on the lock without losing exclusivity, for backends where
   that's a meaningful operation.
-- **FR10.** The system must remain correct under the assignment's stated
+- The system must remain correct under the assignment's stated
   operating conditions: workers that stall for unbounded, unknowable
   time; a network that delays and reorders requests; clocks that drift
   and step; job durations that vary from sub-second to TTL-brushing.
 
 ## 2. Non-functional requirements
 
-- **NFR1 — Safety (highest priority).** No write is ever accepted for an
+- Safety (highest priority): No write is ever accepted for an
   entity out of fencing order, under any combination of worker stall,
   network delay, or clock skew. This takes priority over every NFR below
   — an available-but-unsafe coordinator is worse than an unavailable one
   for a billing ledger.
-- **NFR2 — Fencing-token durability.** The token source must never
+- Fencing-token durability: The token source must never
   reissue or roll back a previously-issued value, including across a
   leader/primary failover of the coordination service itself.
-- **NFR3 — Availability of the coordination service.** No single node
+- Availability of the coordination service.** No single node
   failure in the coordination layer should make entity locking
   unavailable fleet-wide. (In tension with NFR2 for some backends — see
   section 4.)
-- **NFR4 — Acquisition latency.** Lock acquire/release should complete
+- **NFR4 — Acquisition latency: Lock acquire/release should complete
   within a bounded, predictable window under normal (non-contended)
   load. Target: low-single-digit milliseconds for Redis-backed paths,
   tens of milliseconds for ZooKeeper-backed paths (consensus round-trip
   is the floor).
-- **NFR5 — Throughput / scale.** The design must support at minimum
+- Throughput / scale: The design must support at minimum
   thousands of distinct, independently-locked entity keys and tens of
   concurrently contending workers per hot entity without degrading
   correctness or falling over.
-- **NFR6 — Dead-worker detection latency.** Bounded and tunable per
+- Dead-worker detection latency.** Bounded and tunable per
   workload class; explicitly allowed to trade against NFR2/NFR3 (see the
   TTL/session-timeout discussion in section 7).
-- **NFR7 — Observability.** Lock acquisition latency, contention/wait
+- Observability: Lock acquisition latency, contention/wait
   time, session or TTL expirations, and rejected-write counts must be
   visible to operators, not just correct in code.
-- **NFR8 — Operability.** The coordination service must be deployable,
+- Operability: The coordination service must be deployable,
   monitorable, and recoverable using standard tooling for whatever
   backend is chosen — not a bespoke, unfamiliar operational surface.
-- **NFR9 — Testability against real faults.** The design must be
+- Testability against real faults.** The design must be
   verifiable against actual process stalls and network partitions, not
   only application-level timing tricks (`Thread.sleep`), before being
   trusted in production.
-- **NFR10 — Fairness (soft).** Waiting workers should be served roughly
+- Fairness (soft): Waiting workers should be served roughly
   in arrival order where the backend allows it cheaply — not a
   correctness requirement, but a quality-of-service one.
 
@@ -250,7 +250,7 @@ that mitigation actually costs.
 | 1. Single Redis | Hard SPOF; no failover at all | Put Sentinel/Cluster in front of it | You've just built option 2, and inherited option 2's problem |
 | 2. Redis Cluster/Sentinel | Async replication can roll a fencing token backward on failover | Issue `WAIT 1 <timeout>` after every `INCR`/`SET` before trusting it | Added round-trip latency on *every* lock operation; still not linearizable across every failure mode (e.g. split-brain during network partition) |
 | 3. Redlock | Safety depends on bounded clock drift / bounded execution time, which the exercise rules out | Operationally bound clock drift (NTP monitoring + alerting) and bolt a fencing token onto the resource | Contested even with mitigations (see Kleppmann/Sanfilippo); the bolted-on counter still needs its own durability story, which is option 2's or option 4's problem again |
-| 4. ZooKeeper | Session-timeout floor is seconds, not sub-second; hand-rolled client has known footguns; per-op latency is the highest of the four | Use Curator instead of a hand-rolled client for the footguns; for sub-second detection, consider a **hybrid**: Redis TTL lock for fast advisory exclusion, ZooKeeper-issued token as the actual fencing authority checked at the resource | The hybrid adds a second system to operate and a second thing to reason about the failure modes of — worth it only if sub-second dead-worker detection is a hard requirement, which for a billing ledger it wasn't judged to be |
+| 4. ZooKeeper | Session-timeout floor is seconds, not sub-second; hand-rolled client has known footguns; per-op latency is the highest of the four | Use Curator instead of a hand-rolled client for the footguns; for sub-second detection, consider a hybrid: Redis TTL lock for fast advisory exclusion, ZooKeeper-issued token as the actual fencing authority checked at the resource | The hybrid adds a second system to operate and a second thing to reason about the failure modes of — worth it only if sub-second dead-worker detection is a hard requirement, which for a billing ledger it wasn't judged to be |
 
 The pattern across rows 1–3: every mitigation for a Redis-family option
 either reduces to rebuilding a piece of what ZooKeeper already gives you
@@ -267,7 +267,7 @@ trade-offs.
 
 ### Approach 1: Single-instance Redis lock (baseline, implemented)
 
-**How it works:** a worker calls `RedisLock.acquire(entityKey, ttl, ...)`,
+How it works: a worker calls `RedisLock.acquire(entityKey, ttl, ...)`,
 which does `SET lock:<entity> <owner> NX PX <ttl>` against one Redis
 process. On success, it separately calls `INCR fence:<entity>` to mint a
 fencing token, independent of the lock key's own TTL. Release is a
@@ -413,15 +413,15 @@ backstop (idempotency keys threaded downstream, or reconciliation).
 
 ### The guarantee
 
-Precisely: **for a given entity key, the protected resource never applies
+Precisely: for a given entity key, the protected resource never applies
 a write whose fencing token is not strictly greater than every token it
-has already accepted for that entity.**
+has already accepted for that entity.
 
-That is *not* "at most one worker executes the critical section at a
+That is not "at most one worker executes the critical section at a
 time" — the difference is the point of this exercise. `ZooKeeperLock`
 alone only promises that at most one worker holds the lowest-sequence
 ephemeral znode at a given instant; a worker can be descheduled — GC
-pause, blocked syscall, CPU steal — for an unbounded, *unknowable* amount
+pause, blocked syscall, CPU steal — for an unbounded, unknowable amount
 of time while it still believes it holds the lock. Lock possession is
 never mutual exclusion over the critical section; it's a claim about the
 lock's own state, which a paused worker cannot observe.
@@ -432,17 +432,17 @@ on creation, which only ever increases for a given entity regardless of
 how many times the lock has been acquired, expired, or handed to a
 waiting worker. `ProtectedResource.write()` rejects anything not strictly
 greater than the last accepted token. This holds independent of clock
-behavior, network delay, or worker stalls, **given two assumptions**:
+behavior, network delay, or worker stalls, given two assumptions:
 
-1. **The fencing token source never rolls back.** For ZooKeeper this is
+1. The fencing token source never rolls back. For ZooKeeper this is
    structural: the sequence number is part of the replicated log itself
    and cannot be reissued lower as long as a quorum of the ensemble
    survives — see option 4 above for why this is the deciding factor
-   over options 1–3. (The retained single-instance Redis path does *not*
+   over options 1–3. (The retained single-instance Redis path does not
    have this property — see option 1 — and should not be trusted for
    this guarantee if it's ever wired up for something real.)
-2. **The fencing token is the sole authority for whether a write is
-   allowed to land** — for every side effect the worker triggers, not
+2. The fencing token is the sole authority for whether a write is
+   allowed to land — for every side effect the worker triggers, not
    just the call into `ProtectedResource`. This holds regardless of
    backend, and is exactly where it breaks; see the next section.
 
@@ -460,9 +460,9 @@ walkthrough.)
 
 But Worker A may already have caused an external side effect — the
 payment gateway call — that had already fired and cannot be un-sent
-through this mechanism. **That's the failure this design cannot prevent
+through this mechanism. That's the failure this design cannot prevent
 at the lock: a non-idempotent side effect triggered by a worker who has
-since been fenced out.** `ProtectedResource` only ever sees the write
+since been fenced out. `ProtectedResource` only ever sees the write
 attempt, not whatever the worker did on the way there. It's caught only
 if the downstream system is itself idempotent, or if the fencing token is
 threaded through to that call as an idempotency key, so the *external*
@@ -476,15 +476,15 @@ primitive does not make a non-idempotent downstream call safe.
 
 ### The TTL decision
 
-Both extremes are real and neither is free. **Too short:** a legitimate
+Both extremes are real and neither is free. Too short: a legitimate
 long-running job loses its lock mid-flight; a second worker starts on the
 same entity believing it has exclusivity; wasted work, and possibly a
 non-idempotent side effect that already fired. **Too long:** a worker
 that's actually dead holds the entity hostage before anyone else can
 make progress — an availability cost, not a correctness one, but real.
 
-**ZooKeeper's session model partially defuses this rather than solving
-it.** Liveness is heartbeated automatically by the client library on its
+ZooKeeper's session model partially defuses this rather than solving
+it. Liveness is heartbeated automatically by the client library on its
 own thread, so a worker that's merely slow (blocked on I/O, doing CPU
 work) does not lose its lock — no manual renewal call anywhere in
 `JobRunner`, because the heartbeat isn't coupled to the job's own
@@ -520,41 +520,41 @@ as the rejected baseline rather than a real alternative.
 
 ### What you'd do with more time / in production
 
-- **Run ZooKeeper as a real multi-node ensemble** (3 or 5 nodes) and
+- Run ZooKeeper as a real multi-node ensemble (3 or 5 nodes) and
   actually test the failover-durability claim by killing a minority of
   nodes mid-run and confirming fencing tokens still never go backwards.
   The single-node `docker-compose.yml` here proves the algorithm, not the
   fault-tolerance property that's the entire reason option 4 was chosen
   over options 1–3.
-- **Switch to Curator's `InterProcessMutex`** for production ZooKeeper
+- Switch to Curator's `InterProcessMutex` for production ZooKeeper
   usage instead of the hand-rolled `ZooKeeperLock` here, specifically for
   its handling of session-reconnection edge cases (a `Disconnected` event
   is not the same as `Expired`; a naive watcher can double-fire or miss
   events across a reconnect) that this simplified version does not
   handle. Hand-rolling it here was a reasonable call for this exercise
   (keeps the algorithm visible for review) and a bad one for production.
-- **Propagate the fencing token downstream** as an idempotency key on any
+- Propagate the fencing token downstream as an idempotency key on any
   external call a worker makes mid-critical-section — "the failure you
   can't prevent at the lock" has no backstop today beyond being named in
   this doc.
-- **Add reconciliation.** `ProtectedResource.rejected()` exists so an
+- Add reconciliation. `ProtectedResource.rejected()` exists so an
   audit job can look for evidence that a rejected writer's side effects
   landed somewhere else anyway, and alert or compensate.
-- **Consider the hybrid from section 5** if sub-second dead-worker
+- Consider the hybrid from section 5 if sub-second dead-worker
   detection turns out to be a real requirement for some entity classes:
   Redis TTL for fast advisory exclusion, ZooKeeper-issued sequence number
   as the actual fencing authority the resource checks.
-- **Test against real faults, not `Thread.sleep()`/force-closed
-  sessions.** The stalled-worker scenarios fake their failure with
+- Test against real faults, not `Thread.sleep()`/force-closed
+  sessions. The stalled-worker scenarios fake their failure with
   application-level timing tricks; a more honest suite would use
   `kill -STOP`/`-CONT` on a real worker process and something like
   Toxiproxy for actual network delay/partition between a worker and its
   coordination backend.
-- **Run workers as separate processes,** not threads sharing one JVM
+- Run workers as separate processes, not threads sharing one JVM
   object as "the resource" — proves the ordering logic but not real
   network reordering or a genuinely crashed process (as opposed to a
   `.close()` call) losing a ZooKeeper session.
-- **Retire or clearly quarantine the single-instance Redis path** if this
+- Retire or clearly quarantine the single-instance Redis path if this
   ever ships for real. It's kept in this repo deliberately, as the
   rejected baseline that makes the case for option 4 concrete rather than
   asserted — but "the code still exists and still works" is exactly how
@@ -581,7 +581,7 @@ class of scenarios as the Java harnesses:
   alive" worker that keeps its lock through a multi-second sleep with
   zero heartbeat calls, and a "session expired" case where a worker's
   session is force-expired mid-job and a queued second worker takes over
-  via a watch. **30/30 runs passed**, including 10 runs of the
+  via a watch. 30/30 runs passed, including 10 runs of the
   session-expiry case, each producing exactly one commit and one
   rejection with the expected sequence-number tokens.
 - `verify/verify_fencing.py` (Redis/TTL model — the retained, rejected
